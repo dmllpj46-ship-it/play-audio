@@ -122,10 +122,37 @@ request and never defaults to on.
 3. **One stream at a time.** Starting new audio stops the previous track automatically,
    so two songs never overlap.
 
+## Why background playback survives session switches
+
+`DETACHED_PROCESS` detaches the console but **not the process tree**. Agent hosts
+(WorkBuddy, Claude Code, and similar) commonly tear down the entire tree spawned by a
+tool call when a session ends or switches — background playback dies with it. The
+symptom is distinctive: music stops and the log has no closing line at all.
+
+So on Windows the worker is created through **WMI `Win32_Process.Create`**. Its parent
+is `WmiPrvSE.exe`, entirely outside the caller's tree. Observed chain:
+
+```
+python.exe (worker) ← python.exe (venv launcher) ← WmiPrvSE.exe ← svchost.exe ← services.exe
+```
+
+Fallback order: WMI → `CREATE_BREAKAWAY_FROM_JOB` → plain `DETACHED_PROCESS`.
+
+Two consequences, both handled:
+
+- A WMI-spawned process **does not reliably inherit the caller's environment**, so the
+  state directory cannot live under `%TEMP%`. It is fixed at
+  `%LOCALAPPDATA%\wb-audio-player` (`~/.cache/wb-audio-player` on POSIX).
+- The state dir and the absolute ffplay path are written into the job file and passed to
+  the worker explicitly, so nothing depends on inherited environment.
+- The pid WMI returns is not necessarily the worker's real pid (a venv `python.exe` is a
+  launcher that spawns another interpreter). Liveness checks therefore trust the pid the
+  **worker writes into the state file itself**.
+
 ## State file
 
-`<tmp>/wb-audio-player/current.json` holds pid, current track, index, duration, volume.
-In playlist mode the pid is the **worker's**; ffplay is its child.
+`%LOCALAPPDATA%\wb-audio-player\current.json` holds pid, current track, index, duration,
+volume. In playlist mode the pid is the **worker's**; ffplay is its child.
 Stale files are harmless — `--status` and `--stop` verify the pid is alive and treat a
 dead pid as idle, then clean up.
 

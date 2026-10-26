@@ -21,7 +21,25 @@ import time
 from pathlib import Path
 
 IS_WIN = os.name == "nt"
-STATE_DIR = Path(os.environ.get("TEMP") or os.environ.get("TMPDIR") or "/tmp") / "wb-audio-player"
+
+
+def _state_root() -> Path:
+    """Fixed state directory.
+
+    Do not use %TEMP%: the worker is now spawned through WMI, whose environment is not
+    guaranteed to match the caller's. If TEMP differs, --status would look in the wrong
+    place and report "idle" while music is playing.
+    """
+    if IS_WIN:
+        base = os.environ.get("LOCALAPPDATA")
+        root = Path(base) if base else Path.home() / "AppData" / "Local"
+        return root / "wb-audio-player"
+    base = os.environ.get("XDG_CACHE_HOME")
+    root = Path(base) if base else Path.home() / ".cache"
+    return root / "wb-audio-player"
+
+
+STATE_DIR = _state_root()
 STATE_FILE = STATE_DIR / "current.json"
 JOB_FILE = STATE_DIR / "job.json"
 LOG_FILE = STATE_DIR / "worker.log"
@@ -44,6 +62,7 @@ AUDIO_EXT = {".mp3", ".wav", ".flac", ".m4a", ".aac", ".ogg", ".opus", ".wma", "
 
 CREATE_DETACHED = 0x00000008
 CREATE_NO_WINDOW = 0x08000000
+CREATE_BREAKAWAY_FROM_JOB = 0x01000000
 STILL_ACTIVE = 259
 
 
@@ -231,6 +250,42 @@ def do_list() -> int:
     return 0
 
 
+def _wmi_spawn(cmdline: str) -> int | None:
+    """Create a process through WMI; returns its pid, or None on failure.
+
+    Why not subprocess + DETACHED_PROCESS: that only detaches the console, not the
+    process tree. Agent hosts (WorkBuddy, Claude Code, and friends) commonly tear down
+    the whole tree spawned by a tool call when the session ends — background playback
+    dies with it.
+
+    A process created via WMI has WmiPrvSE.exe as its parent, so it sits outside the
+    caller's tree and survives session switches.
+
+    The command line is passed to PowerShell as base64 to sidestep quoting hell.
+    """
+    import base64
+
+    b64 = base64.b64encode(cmdline.encode("utf-16-le")).decode("ascii")
+    ps = (
+        "$c = [Text.Encoding]::Unicode.GetString([Convert]::FromBase64String('" + b64 + "')); "
+        "$r = ([wmiclass]'Win32_Process').Create($c); "
+        "if ($r.ReturnValue -eq 0) { $r.ProcessId } else { 'ERR:' + $r.ReturnValue }"
+    )
+    try:
+        out = subprocess.run(
+            ["powershell", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass",
+             "-Command", ps],
+            capture_output=True, text=True, timeout=45,
+        )
+        txt = (out.stdout or "").strip()
+        if txt.isdigit():
+            return int(txt)
+        log(f"wmi spawn failed: out={txt!r} err={(out.stderr or '').strip()[:300]!r}")
+    except Exception as exc:
+        log(f"wmi spawn exception: {exc}")
+    return None
+
+
 def do_playlist(args) -> int:
     files = scan_playlist()
     if not files:
@@ -254,48 +309,89 @@ def do_playlist(args) -> int:
         "volume": args.volume,
         "loop": bool(args.loop),
         "seconds": args.seconds or 0,
+        # Passed explicitly: a WMI-spawned process may not inherit our environment
+        "state_dir": str(STATE_DIR),
+        "ffplay": ffplay,
     }
     STATE_DIR.mkdir(parents=True, exist_ok=True)
     JOB_FILE.write_text(json.dumps(job, ensure_ascii=False), encoding="utf-8")
 
-    flags = CREATE_DETACHED | CREATE_NO_WINDOW if IS_WIN else 0
-    try:
-        proc = subprocess.Popen(
-            [sys.executable, os.path.abspath(__file__), "--_worker", str(JOB_FILE)],
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            creationflags=flags,
-            start_new_session=not IS_WIN,
-        )
-    except Exception as exc:
-        print(f"Failed to start player process: {exc}", file=sys.stderr)
-        return 1
+    worker_pid = None
+    if IS_WIN:
+        cmdline = (f'"{sys.executable}" "{os.path.abspath(__file__)}" '
+                   f'--_worker "{JOB_FILE}"')
+        worker_pid = _wmi_spawn(cmdline)
+        if worker_pid is None:
+            log("wmi spawn unavailable, falling back to breakaway+detached")
 
-    time.sleep(0.6)
-    if not is_alive(proc.pid):
+    if worker_pid is None:
+        # Fallback: BREAKAWAY_FROM_JOB also escapes a job, if the job permits it
+        flags = CREATE_NO_WINDOW
+        if IS_WIN:
+            flags |= CREATE_BREAKAWAY_FROM_JOB
+        try:
+            proc = subprocess.Popen(
+                [sys.executable, os.path.abspath(__file__), "--_worker", str(JOB_FILE)],
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                creationflags=flags,
+                start_new_session=not IS_WIN,
+            )
+            worker_pid = proc.pid
+        except OSError:
+            # A job that forbids breakaway yields WinError 5; fall back to plain detached
+            proc = subprocess.Popen(
+                [sys.executable, os.path.abspath(__file__), "--_worker", str(JOB_FILE)],
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                creationflags=CREATE_DETACHED | CREATE_NO_WINDOW if IS_WIN else 0,
+                start_new_session=not IS_WIN,
+            )
+            worker_pid = proc.pid
+
+    time.sleep(1.2)
+    # The pid WMI returns may not be the worker's real pid (venv python.exe is a
+    # launcher that spawns the real interpreter). Trust the pid the worker wrote itself.
+    st = read_state()
+    real_pid = st.get("pid") or worker_pid
+    if not is_alive(real_pid):
         print("Player process exited immediately; check ffplay and the audio files.",
               file=sys.stderr)
         return 1
+    worker_pid = real_pid
 
     order = "shuffled" if args.shuffle else "sequential"
     print(f"Playlist: {len(files)} track(s), {order}"
           + (", looping" if args.loop else ""))
     print(f"Directory: {PLAYLIST_DIR}")
-    print(f"Volume {args.volume}, pid={proc.pid}")
+    print(f"Volume {args.volume}, pid={worker_pid}")
     print("Stop: --stop   Status: --status")
     return 0
 
 
 def run_worker(job_path: str) -> int:
     """Resident process: plays tracks one at a time, advancing automatically."""
+    global STATE_DIR, STATE_FILE, JOB_FILE, LOG_FILE
+
     try:
         job = json.loads(Path(job_path).read_text(encoding="utf-8"))
     except Exception as exc:
         log(f"worker: cannot read job file {job_path}: {exc}")
         return 1
 
-    ffplay = find_bin("ffplay")
+    # A WMI-spawned process may not share our environment; honour the explicit state dir
+    sd = job.get("state_dir")
+    if sd:
+        STATE_DIR = Path(sd)
+        STATE_FILE = STATE_DIR / "current.json"
+        JOB_FILE = STATE_DIR / "job.json"
+        LOG_FILE = STATE_DIR / "worker.log"
+
+    ffplay = job.get("ffplay") or find_bin("ffplay")
+    if not ffplay or not Path(ffplay).exists():
+        ffplay = find_bin("ffplay")
     if not ffplay:
         log("worker: ffplay not found")
         return 1
