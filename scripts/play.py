@@ -24,6 +24,7 @@ IS_WIN = os.name == "nt"
 STATE_DIR = Path(os.environ.get("TEMP") or os.environ.get("TMPDIR") or "/tmp") / "wb-audio-player"
 STATE_FILE = STATE_DIR / "current.json"
 JOB_FILE = STATE_DIR / "job.json"
+LOG_FILE = STATE_DIR / "worker.log"
 
 # Default playlist directory; override with the WB_PLAYLIST_DIR env var.
 PLAYLIST_DIR = Path(
@@ -120,6 +121,16 @@ def save_config(cfg: dict) -> None:
 
 
 # ---------------------------------------------------------------- state
+def log(msg: str) -> None:
+    """Worker diagnostic log. Failing to log must never affect playback."""
+    try:
+        STATE_DIR.mkdir(parents=True, exist_ok=True)
+        with open(LOG_FILE, "a", encoding="utf-8") as fh:
+            fh.write(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] {msg}\n")
+    except Exception:
+        pass
+
+
 def read_state() -> dict:
     try:
         return json.loads(STATE_FILE.read_text(encoding="utf-8"))
@@ -128,8 +139,31 @@ def read_state() -> dict:
 
 
 def write_state(data: dict) -> None:
-    STATE_DIR.mkdir(parents=True, exist_ok=True)
-    STATE_FILE.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+    """Atomically write the state file.
+
+    On Windows, reading and writing the same file concurrently can raise
+    PermissionError. This used to be unguarded, so the exception escaped the worker
+    loop and killed the playback process silently (music just stopped, no log, no
+    trace). Now we write to a temp file and os.replace() it, retrying on failure;
+    a final failure only costs one stale status update instead of the whole session.
+    """
+    try:
+        STATE_DIR.mkdir(parents=True, exist_ok=True)
+    except Exception:
+        return
+
+    payload = json.dumps(data, ensure_ascii=False, indent=2)
+    tmp = STATE_FILE.with_suffix(".tmp")
+    for attempt in range(6):
+        try:
+            tmp.write_text(payload, encoding="utf-8")
+            os.replace(tmp, STATE_FILE)
+            return
+        except Exception as exc:
+            if attempt == 5:
+                log(f"write_state gave up after 6 attempts: {exc}")
+                return
+            time.sleep(0.03 * (attempt + 1))
 
 
 def clear_state() -> None:
@@ -257,11 +291,13 @@ def run_worker(job_path: str) -> int:
     """Resident process: plays tracks one at a time, advancing automatically."""
     try:
         job = json.loads(Path(job_path).read_text(encoding="utf-8"))
-    except Exception:
+    except Exception as exc:
+        log(f"worker: cannot read job file {job_path}: {exc}")
         return 1
 
     ffplay = find_bin("ffplay")
     if not ffplay:
+        log("worker: ffplay not found")
         return 1
 
     files = job.get("files") or []
@@ -270,19 +306,27 @@ def run_worker(job_path: str) -> int:
     loop = bool(job.get("loop"))
     total = len(files)
     if not files:
+        log("worker: empty file list")
         return 1
 
     child_flags = CREATE_NO_WINDOW if IS_WIN else 0
+    log(f"worker start: {total} track(s), volume={volume}, limit={limit}, loop={loop}, pid={os.getpid()}")
+
+    fail_streak = 0
 
     while True:
         for i, f in enumerate(files):
             if not Path(f).exists():
+                log(f"worker: missing file, skipped: {f}")
                 continue
+
             cmd = [ffplay, "-nodisp", "-autoexit", "-loglevel", "quiet",
                    "-volume", str(volume)]
             if limit:
                 cmd += ["-t", str(limit)]
             cmd.append(f)
+
+            t_start = time.time()
             try:
                 child = subprocess.Popen(
                     cmd,
@@ -291,7 +335,12 @@ def run_worker(job_path: str) -> int:
                     stderr=subprocess.DEVNULL,
                     creationflags=child_flags,
                 )
-            except Exception:
+            except Exception as exc:
+                log(f"worker: failed to spawn ffplay for {Path(f).name}: {exc}")
+                fail_streak += 1
+                if fail_streak >= 3:
+                    log("worker: 3 consecutive spawn failures, stopping")
+                    break
                 continue
 
             write_state({
@@ -308,10 +357,31 @@ def run_worker(job_path: str) -> int:
                 "volume": volume,
                 "loop": loop,
             })
-            child.wait()
-        if not loop:
+
+            try:
+                rc = child.wait()
+            except Exception as exc:
+                log(f"worker: wait() failed on {Path(f).name}: {exc}")
+                rc = -1
+
+            played = time.time() - t_start
+            # An exit under 1s usually means no audio device or a corrupt file
+            if played < 1.0:
+                fail_streak += 1
+                log(f"worker: ffplay exited after {played:.2f}s (rc={rc}) on {Path(f).name}; "
+                    f"fail_streak={fail_streak}")
+                if fail_streak >= 3:
+                    log("worker: 3 consecutive immediate exits, giving up "
+                        "(check audio device / file integrity)")
+                    break
+            else:
+                fail_streak = 0
+                log(f"worker: finished {Path(f).name} in {played:.1f}s (rc={rc})")
+
+        if not loop or fail_streak >= 3:
             break
 
+    log("worker end")
     clear_state()
     return 0
 
@@ -539,7 +609,15 @@ def main() -> int:
     args.volume = max(0, min(100, args.volume))
 
     if args._worker:
-        return run_worker(args._worker)
+        # Safety net: any unhandled exception lands in the log instead of
+        # letting the process vanish without a trace.
+        try:
+            return run_worker(args._worker)
+        except Exception:
+            import traceback
+            log("worker crashed with unhandled exception:\n" + traceback.format_exc())
+            clear_state()
+            return 1
     if args.stop:
         return do_stop()
     if args.status:

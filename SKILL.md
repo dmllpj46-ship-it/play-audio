@@ -129,6 +129,15 @@ In playlist mode the pid is the **worker's**; ffplay is its child.
 Stale files are harmless — `--status` and `--stop` verify the pid is alive and treat a
 dead pid as idle, then clean up.
 
+`worker.log` in the same directory is the playlist diagnostic log: per-track start/end,
+ffplay exit codes, exception tracebacks. **When playback stops unexpectedly, read that
+file first** instead of guessing.
+
+State writes are atomic (write `.tmp`, then `os.replace`, with retries). This is not
+decoration: on Windows, reading and writing the same file concurrently raises
+`PermissionError`. An earlier version left that unguarded, so the worker crashed
+silently — music simply stopped, with no log and no trace.
+
 ## Gotchas
 
 - **`ffplay` not found** → install ffmpeg (`winget install Gyan.FFmpeg`, `brew install ffmpeg`,
