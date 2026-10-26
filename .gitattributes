@@ -1,0 +1,11 @@
+# Normalize line endings: keep LF in the repo regardless of platform
+* text=auto eol=lf
+
+*.py   text eol=lf
+*.md   text eol=lf
+*.json text eol=lf
+
+# Binary assets (none yet, but future-proof)
+*.png  binary
+*.jpg  binary
+*.mp3  binary
